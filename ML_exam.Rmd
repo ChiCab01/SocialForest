@@ -1,0 +1,1545 @@
+---
+title: "Machine learning - exam 28/04/2025"
+author: "Chiara Cabrini, Stefano Masier"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+# housekeeping
+
+library(pacman)
+p_load("skimr","tidyverse","reshape2","gridExtra", "data.table","kableExtra", "knitr", "car",  "here","tidyselect","scales", "ggpubr","stringr","readr", "readxl", "gt", "gtsummary", "naniar", "tidymodels", "agua", "rpart", "rpart.plot", "caret", "magick", "webshot2", "psych", "mice", "glmnet", "randomForest", "ipred", "themis", "DALEX", "pdp", "lme4")
+```
+
+```{r datawrangling, echo=FALSE}
+# dataset loading and data wrangling
+
+Project_data = read_csv("Project_data.xls", show_col_types = FALSE)
+
+Project_data = Project_data %>%
+  mutate(Nat_Home = factor(ifelse(tolower(Nationality) == "velorian", 1, 0))) %>%
+  mutate(Total_F = ifelse(Total < 6, "low", ifelse(Total > 12, "high", "medium"))) %>% # creation of categorical variable: adjust thresholds if needed
+  mutate(Total_F = factor(Total_F, ordered = TRUE, levels = c("low", "medium", "high")), # formatting
+         across(c(Profession,Sex,MaritalStatus,WorkIncapacity,AlcoholCurrent,AlcoholAbuseCurrent,Cannabis,PathAcuteSub,PathChronic,young), ~as.factor(.x)),
+         D_aggregate = ifelse(is.na(D_aggregate), "Other", D_aggregate),
+         CGI=factor(CGI, ordered=TRUE, levels=as.character(1:7))) %>%
+  mutate(CGI.na = factor(ifelse(is.na(CGI), 1, 0))) %>%
+  filter(!(Municipality %in% c("GALVEN CROSS","FENNOCK","HALDRIM"))) %>% # remove individuals outside Valdoria and/or fow which no spatial data was available 
+  filter(!(D_aggregate %in% c("Other", "Eating disorders", "Non-epileptic paroxysmal episodes"))) # remove those classes with less than 10 entries in D_aggregate; 8 observations lost
+```
+
+
+# Missing values
+
+
+```{r, NAgraph, warning=FALSE}
+
+Project_data_3 = Project_data %>%
+  dplyr::select(- CGI.na, -Province.Code)
+  
+missing_data = data.frame(
+  variable = names(Project_data_3),
+  missing_count = colSums(is.na(Project_data_3))
+)
+missing_data = missing_data[order(missing_data$missing_count, decreasing = TRUE), ]
+
+png("missing_data_plot.png", width = 700, height = 1000)
+ggplot(missing_data, aes(x = reorder(variable, missing_count), y = missing_count)) +
+  geom_bar(stat = "identity", fill = "darkblue", width = 0.9) + 
+  coord_flip() + 
+  labs(
+    title = "Number of missing values per variable",
+    x = "Variable",
+    y = "Number of missing values compared to the total observations"
+  ) +
+  theme_minimal() +  
+  theme(
+    axis.text.y = element_text(size = 15), 
+    axis.text.x = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    plot.title = element_text(hjust = 0.5, size = 15)
+  ) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, nrow(Project_data_3)))
+dev.off()
+```
+
+```{r NAtable}
+tab_missing_values <- function(Project_data_3, filename_prefix = "missing_values_part") {
+  missing_values <- colSums(is.na(Project_data_3))
+
+  perc_missing <- (missing_values / nrow(Project_data_3)) * 100
+
+  tab <- data.frame(
+    Missing_Values = missing_values,
+    Perc_Missing = round(perc_missing,3)
+  )
+  tab <- tab[order(-tab$Perc_Missing), ]
+
+  # split in two parts for readibility
+  n <- nrow(tab)
+  midpoint <- ceiling(n / 2)
+  tab1 <- tab[1:midpoint, ]
+  tab2 <- tab[(midpoint + 1):n, ]
+  
+  export_tab <- function(subtab, filename) {
+    kbl_tab <- kable(subtab, format = "html") %>%
+      kable_styling(full_width = FALSE)
+    kbl_tab %>% as_image(file = filename)
+    print(paste("Exported table:", filename))
+  }
+
+  export_tab(tab1, paste0(filename_prefix, "1.png"))
+  export_tab(tab2, paste0(filename_prefix, "2.png"))
+}
+
+tab_missing_values(Project_data_3)
+```
+
+## Missing values in Pathology
+
+```{r, echo=FALSE}
+# merging the two variables `PathAcuteSub` and `PathChronic` in a single, more comprehensive variable
+Project_data = Project_data %>%
+  mutate(Pathology = ifelse(PathAcuteSub != 1 & PathChronic != 1, 0,
+                            ifelse(PathAcuteSub == 1 & PathChronic != 1, 1,
+                                   ifelse(PathAcuteSub != 1 & PathChronic == 1, 2,
+                                          ifelse(PathAcuteSub == 1 & PathChronic == 1, 3, 99))))) 
+Project_data %>%
+dplyr::filter(PathAcuteSub == 1 & PathChronic == 1) %>%
+  summarise(n = n()) # only one person has both acute and long-term pathologies
+
+# NA table
+Missing_path = sum(is.na(Project_data$Pathology))
+
+ID_Chron_and_Path <- Project_data[!is.na(Project_data$PathAcuteSub) & !is.na(Project_data$PathChronic) & Project_data$PathAcuteSub == 1 & Project_data$PathChronic == 1, ]
+n_ID_Chron_and_Path <- nrow(ID_Chron_and_Path)
+
+missing_Pathology <- data.frame(
+  Object = c("Number of patients with both Chronic and Acute disease", "Number of missing in Pathology"),
+  Number_of_missing = c(n_ID_Chron_and_Path, Missing_path)
+)
+
+png("tabPathology.png", width = 600, height = 100)
+grid.table(missing_Pathology)
+dev.off()
+
+
+# Due to the huge amount of missing values, we chose to remove these variables
+Project_data_02 = Project_data %>%
+  dplyr::select(-Pathology, -PathAcuteSub, -PathChronic)
+```
+
+## Train/test split (before any imputation)
+
+```{r split}
+item_vars = grep("^(HAB|NET|RES|ACT)_", names(Project_data_02), value = TRUE)
+
+Project_data_02 = Project_data_02 %>%
+  mutate(outcome_obs = complete.cases(pick(all_of(item_vars))),
+         Total_raw = rowSums(across(all_of(item_vars), ~as.numeric(as.character(.x)))),
+         Total_F_raw = factor(ifelse(Total_raw < 6, "low", ifelse(Total_raw > 12, "high", "medium")),
+                              levels = c("low", "medium", "high")))
+
+set.seed(42)
+obs_rows = Project_data_02 %>%
+  mutate(row_id = row_number()) %>%
+  filter(outcome_obs) %>%
+  dplyr::select(row_id, Total_F_raw)
+split.obs = initial_split(obs_rows, prop = .8, strata = Total_F_raw)
+
+Project_data_02 = Project_data_02 %>%
+  mutate(is_test = row_number() %in% testing(split.obs)$row_id) %>%
+  dplyr::select(-Total_raw, -Total_F_raw)
+
+table(outcome_observed = Project_data_02$outcome_obs, test = Project_data_02$is_test)
+```
+
+## NAs in HAB, NET, RES, ACT.
+
+Two-steps procedure:
+
+- step 1: we first choose predictors for the questions of the different sections. If these variables have very few NAs, we fill them with the mode; otherwise we impute them using all other variables as predictors.
+- step 2: we apply the MICE algorithm to fill the NAs in HAB_, NET_, RES_, ACT_ scores using a LASSO logistic regression model for binary variables (random forests where LASSO proved unstable), to impute the missing data based on regressors selected a priori.
+
+
+```{r}
+Modes = function(x) { # there is no built-in function for the mode, so we made our own
+  ux = unique(x[!is.na(x)]) 
+  tab = tabulate(match(x,ux))
+  ux[tab == max(tab)]
+}
+
+
+Project_data_02= Project_data_02 %>%
+  mutate(across(c(Profession, Children, Siblings, MaritalStatus), ~coalesce(.x, Modes(.x[!is_test])[1]))) # for some variables, we can use the mode to fill NAs
+
+
+VAR_dataset <- Project_data_02 %>%
+  dplyr::select(IllnessDuration, CivilDisability, Education, AlcoholCurrent, AlcoholAbuseCurrent,
+                Cannabis, AlcoholPast, Substances) %>%
+  mutate(across(c(Education, AlcoholPast, Substances, AlcoholCurrent, AlcoholAbuseCurrent, Cannabis), ~as.factor(.x)))
+
+png("missing_patternVAR.png", width = 500, height = 500)
+md.pattern(VAR_dataset, rotate.names=TRUE) # bottom line: n. of NAs for a certain variable; on the left we find the n. of lines with the represented configuration of NAs
+dev.off()
+
+methods <- mice::make.method(VAR_dataset)
+# methods depending on variable type:
+## numeric → pmm (predictive mean matching)
+## binary → logreg
+## multilevel factor → polyreg
+## ordinal → polr
+methods["CivilDisability"] <- "pmm"
+methods["Education"] <- "polyreg"
+methods["AlcoholCurrent"] <- "logreg"
+methods["AlcoholAbuseCurrent"] <- "logreg"
+methods["Cannabis"] <- "polyreg"
+methods["AlcoholPast"] <- "logreg"
+methods["Substances"] <- "polyreg"
+methods["IllnessDuration"] <- "pmm" 
+
+set.seed(42)
+impVAR = mice(VAR_dataset, ignore = Project_data_02$is_test, m = 5, maxit = 50, method=methods, print = FALSE) # NA filling
+
+png("plotVAR.png", width = 500, height = 800)
+plot(impVAR, layout = c(2, 8),  cex.axis = 10, cex.main = 10, cex.lab = 10) # as the procedure is Markov-chain based, these graphs must be random and without trends
+dev.off()
+
+png("stripplotVAR_1.png", width = 700, height = 300)
+stripplot(impVAR, CivilDisability+ IllnessDuration ~.imp, pch = c(1, 1), col = c("grey", "red"), cex = c(5, 5), hor=FALSE)
+dev.off()
+
+png("stripplotVAR_2.png", width = 700, height = 600)
+stripplot(impVAR, AlcoholPast + AlcoholCurrent + AlcoholAbuseCurrent ~.imp, factor=0.5, pch = c(1, 1), col = c("grey", "red"), cex = c(4, 4), hor=TRUE)
+dev.off()
+
+png("stripplotVAR_3.png", width = 700, height = 600)
+stripplot(impVAR,  Cannabis + Substances + Education ~.imp, pch = c(1, 1), factor=0.8, col = c("grey", "red"), cex = c(3, 3), hor=TRUE)
+dev.off()
+
+comp.VAR = mice::complete(impVAR, 1)
+
+Project_data_02 = Project_data_02 %>%
+  mutate(across(c(IllnessDuration, CivilDisability, Education, AlcoholCurrent, AlcoholAbuseCurrent,
+                Cannabis, AlcoholPast, Substances), ~comp.VAR[[cur_column()]]))
+```
+
+## Missing data in the answers
+
+```{r imput_HAB}
+HAB_dataset = Project_data_02 %>% dplyr::select(starts_with("HAB_"), Age, Income_percapita, Services, Density, GreenAreas_perc, Culture, Sex) %>%
+  mutate(across(starts_with("HAB_"), ~as.factor(.x)))
+
+png("missing_patternHAB.png", width = 400, height = 400)
+md.pattern(HAB_dataset, rotate.names=TRUE)
+dev.off()
+
+set.seed(42)
+impHAB = mice(HAB_dataset, ignore = Project_data_02$is_test, method = "rf", m = 5, maxit = 20, print = FALSE) # as some combinations had less than 8 lines, the logistic regression with LASSO method was deemed too risky
+impHAB$method # when nothing is written, the variable has no NAs
+
+
+png("plotHAB.png", width = 500, height = 500)
+plot(impHAB,layout = c(2, 4))
+dev.off()
+
+png("stripplotHAB.png", width = 800, height = 400)
+stripplot(impHAB, HAB_Dwelling + HAB_Stability + HAB_Preference + HAB_Surroundings ~.imp, factor = 0.8, col = c("grey", "red"), pch = c(1, 1), cex = c(3, 3), layout = c(4, 1), hor = TRUE) # the imputed values should be distributed like the original data; on the x-axis the number of iteration
+dev.off()
+```
+
+```{r imput_NET}
+NET_dataset = Project_data_02 %>% dplyr::select(starts_with("NET_"), Density, Download, Perc.online.purchases, Age, Sex, psychiatric, Nat_Home, IllnessDuration, CivilDisability, MaritalStatus) %>%
+  mutate(across(starts_with("NET_"), ~as.factor(.x)),
+         MaritalStatus = as.factor(MaritalStatus), 
+         Sex = as.factor(Sex)) 
+
+png("missing_patternNET.png", width = 400, height = 400)
+md.pattern(NET_dataset, rotate.names=TRUE)
+dev.off()
+
+set.seed(42)
+
+method.NET = make.method(NET_dataset)
+method.NET[] = ""
+method.NET[startsWith(names(method.NET), "NET_")] = "lasso.select.logreg"
+impNET = mice(NET_dataset, ignore = Project_data_02$is_test, method = method.NET, m = 5, maxit = 50, print = F)
+plot(impNET)
+
+png("plotNET.png", width = 500, height = 500)
+plot(impNET,layout = c(2, 4))
+dev.off()
+
+png("stripplotNET.png", width = 800, height = 400)
+stripplot(impNET, NET_Peers + NET_Gatherings + NET_Withdrawal + NET_Prejudice ~.imp, factor = 0.8, col = c("grey", "red"), pch = c(1, 1), cex = c(3, 3), layout = c(4, 1), hor = TRUE)
+dev.off()
+```
+
+```{r imput_RES}
+RES_dataset = Project_data_02 %>% dplyr::select(starts_with("RES_"), Age, Sex, Nat_Home,  WorkIncapacity, Profession, Employment, Income_percapita, MaritalStatus, CivilDisability, Children, Siblings, Education) %>%
+  mutate(across(starts_with("RES_"), ~as.factor(.x)),
+         MaritalStatus = as.factor(MaritalStatus),
+         Sex = as.factor(Sex),
+         Profession = as.factor(Profession),
+         Education = as.factor(Education))
+
+png("missing_patternRES.png", width = 400, height = 400)
+md.pattern(RES_dataset, rotate.names=TRUE)
+dev.off()
+
+set.seed(42)
+method.RES = make.method(RES_dataset)
+method.RES[] = ""
+method.RES[startsWith(names(method.RES), "RES_")] = "rf" # convergence issues forced us to discard the LASSO regression model in this case
+impRES = mice(RES_dataset, ignore = Project_data_02$is_test, method = method.RES, m = 5, maxit = 20, print = F)
+
+png("plotRES.png", width = 500, height = 500)
+plot(impRES,layout = c(2, 4))
+dev.off()
+
+png("stripplotRES.png", width = 800, height = 400)
+stripplot(impRES, RES_Budget + RES_Leisure + RES_Occasions + RES_Buffer ~.imp, factor = 0.8, col = c("grey", "red"), pch = c(1, 1), cex = c(3, 3), layout = c(4, 1), hor = TRUE)
+dev.off()
+```
+
+```{r imput_ACT}
+ACT_dataset = Project_data_02 %>% dplyr::select(starts_with("ACT_"), Age, Sex, Profession, WorkIncapacity, CivilDisability, psychiatric, Income_percapita, Employment, Education) %>%
+  mutate(across(starts_with("ACT_"), ~as.factor(.x)),
+         Sex = as.factor(Sex), 
+         Profession = as.factor(Profession),
+         Education = as.factor(Education)) 
+
+png("missing_patternACT.png", width = 400, height = 400)
+md.pattern(ACT_dataset, rotate.names=TRUE)
+dev.off()
+
+
+set.seed(42)
+method.ACT = make.method(ACT_dataset)
+method.ACT[] = ""
+method.ACT[startsWith(names(method.ACT), "ACT_")] = "lasso.select.logreg"
+impACT = mice(ACT_dataset, ignore = Project_data_02$is_test, method = method.ACT, m = 5, maxit = 20, print = F)
+
+png("plotACT.png", width = 500, height = 500)
+plot(impACT,layout = c(2, 4))
+dev.off()
+
+png("stripplotACT.png", width = 800, height = 400)
+stripplot(impACT, ACT_Engagement + ACT_Conditions + ACT_Unfairness + ACT_HealthImpact ~.imp, factor = 0.8, col = c("grey", "red"), pch = c(1, 1), cex = c(3, 3), layout = c(4, 1), hor = TRUE)
+dev.off()
+```
+
+## Missing data in CGI.
+
+```{r}
+tab_CGI = Project_data_02 %>% group_by(D_aggregate) %>% summarise(N.missing = sum(CGI.na == 1), number = n()) # CGI missing data are not uniform, but they are found mainly in the two categories of epilepsy (focal and generalized); 
+
+tab_CGI <- tab_CGI %>% 
+  rename(
+    "Missing values in CGI" = N.missing,
+    "Total observations per group" = number
+  )
+
+png("tab_CGI_missing.png", width = 700, height = 200)
+grid.table(tab_CGI)
+dev.off()
+
+Project_data_02 = Project_data_02 %>% 
+  mutate(D_aggregate = ifelse(D_aggregate %in% c("Generalized epilepsy", "Focal epilepsy"), "Epilepsy", D_aggregate))
+  
+tab_CGI_2 = Project_data_02 %>% group_by(D_aggregate) %>% summarise(N.missing = sum(CGI.na == 1), number = n())
+
+tab_CGI_2 <- tab_CGI_2 %>% 
+  rename(
+    "Missing values in CGI" = N.missing,
+    "Total observations per group" = number
+  )
+
+png("tab_CGI_2_missing.png", width = 700, height = 200)
+grid.table(tab_CGI_2)
+dev.off()
+
+CGI_D_aggregate <- table(Project_data_02$CGI, Project_data_02$D_aggregate)
+CGI_D_aggregate_perc <- round(prop.table(CGI_D_aggregate, margin=2)*100,1)
+CGI_D_aggregate_perc
+
+table(Project_data_02$D_aggregate, useNA = "ifany")
+table(Project_data_02$D_aggregate, is.na(Project_data_02$CGI))
+
+bipolar_data <- Project_data_02 %>% filter(D_aggregate == "Bipolar")
+# summary of CGI missing values for bipolar group
+summary(bipolar_data$CGI)
+print(bipolar_data$CGI)
+
+png("boxplotCGI.png", width = 1000, height = 800)
+ggplot(Project_data_02, aes(x = D_aggregate, y = as.integer(CGI))) +
+  geom_boxplot(fill = "lightblue", outlier.color = "darkred") +
+  labs(title = "Levels of CGI within levels of D_aggregate", x = "D_aggregate", y = "CGI") +
+  theme_minimal() +  
+  theme(
+    axis.text.y = element_text(size = 20), 
+    axis.text.x = element_text(size = 15, angle = 90, hjust = 1, vjust = 0.5),
+    axis.title.y = element_text(size = 20),
+    axis.title.x = element_text(size = 20),
+    plot.title = element_text(hjust = 0.5, size = 20)
+  ) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, max(as.integer(Project_data_02$CGI), na.rm = TRUE) + 0.5))
+dev.off()
+
+CGI_dataset = Project_data_02 %>% 
+  dplyr::select(CGI, D_aggregate, psychiatric, Sex, Age, AlcoholCurrent, Cannabis, Income_percapita, WorkIncapacity, CivilDisability) %>%
+  mutate(across(c(D_aggregate, psychiatric, Sex, AlcoholCurrent, Cannabis, WorkIncapacity), as.factor),
+         CGI = droplevels(CGI))
+
+png("missing_patternCGI.png", width = 500, height = 200)
+md.pattern(CGI_dataset, rotate.names=TRUE)
+dev.off()
+
+set.seed(42)
+
+methodCGI = make.method(CGI_dataset)
+methodCGI[] = ""
+methodCGI["CGI"] = "polr"
+impCGI = mice(CGI_dataset, ignore = Project_data_02$is_test, method = methodCGI, m = 5, maxit = 20, print = F)
+impCGI$method
+impCGI$loggedEvents
+
+png("plotCGI.png", width = 800, height = 300)
+plot(impCGI,layout = c(2, 1))
+dev.off()
+
+png("stripplotCGI.png", width = 500, height = 500)
+stripplot(impCGI, CGI~.imp, factor = 1, pch = c(1, 1), col = c("grey", "red"), cex = c(5, 5), hor=TRUE)
+dev.off()
+
+completed <- mice::complete(impCGI, 1) 
+sum(is.na(completed))
+```
+
+## Full dataset
+
+```{r}
+comp.HAB  = mice::complete(impHAB, 1)
+comp.RES = mice::complete(impRES, 1)
+comp.NET = mice::complete(impNET, 1)
+comp.ACT  = mice::complete(impACT, 1)
+comp.CGI = mice::complete(impCGI, 1)
+
+Dataset.complete = Project_data_02 %>% dplyr::select(-HAB, -NET, -ACT, -RES, -Total, -Total_F, -CGI.na) %>%
+  mutate(across(starts_with("HAB_"), ~comp.HAB[[cur_column()]]),
+         across(starts_with("RES_"), ~comp.RES[[cur_column()]]),
+         across(starts_with("NET_"), ~comp.NET[[cur_column()]]),
+         across(starts_with("ACT_"), ~comp.ACT[[cur_column()]]),
+         across(CGI, ~comp.CGI[[cur_column()]])) %>%
+  mutate(across(c(ID, Service, psychiatric, Education, Profession, MaritalStatus, AlcoholPast, AlcoholCurrent, AlcoholAbuseCurrent, Cannabis,
+                  Substances, D_aggregate), ~as.factor(.x)),
+         across(c(IllnessDuration, CivilDisability, Children, Siblings), ~as.numeric(.x))) # fix the formats
+
+Dataset.complete$CGI = as.numeric(levels(Dataset.complete$CGI))[Dataset.complete$CGI]
+```
+
+## Addition of summary variables for the different groups of answers Total, and Total_F (ordered factor)
+
+```{r}
+Dataset.temp = Dataset.complete %>%
+  mutate(across(starts_with(c("HAB_", "NET_", "RES_", "ACT_")), ~ as.numeric(as.character(.)))) %>%
+  mutate(Total = rowSums(across(starts_with(c("HAB_", "NET_", "RES_", "ACT_"))), na.rm = FALSE))
+
+Dataset.complete = Dataset.complete %>%
+  mutate(Total = Dataset.temp$Total) %>%
+  mutate(Total_F = ifelse(Total < 6, "low", ifelse(Total > 12, "high", "medium"))) %>%
+  mutate(Total_F = factor(Total_F, ordered=TRUE, levels=c("low", "medium", "high")))
+
+Dataset.complete %>%
+  group_by(Total_F) %>%
+  summarise(count = n())
+
+sapply(Dataset.complete %>% dplyr::select(starts_with(c("HAB_", "NET_", "RES_", "ACT_")), Total, Total_F), class) # class check
+```
+
+# TOTAL SCORE
+
+```{r cache = TRUE}
+Dataset.model = Dataset.complete %>% filter(outcome_obs)
+
+Dataset.forest = Dataset.model %>% dplyr::select(Total, Sex, Age, D_aggregate, IllnessDuration, Education, Profession, MaritalStatus, CivilDisability, Children, Siblings, AlcoholCurrent, AlcoholAbuseCurrent, Cannabis, Substances, CGI, psychiatric, Income_percapita, Density, Services, Employment, Culture, Perc.online.purchases, Download, GreenAreas_perc)
+
+train.forest = Dataset.forest[!Dataset.model$is_test, ]
+test.forest = Dataset.forest[Dataset.model$is_test, ]
+```
+
+## Territorial variables
+
+```{r territory}
+area_vars = c("Density", "Income_percapita", "Services", "Employment", "Culture",
+              "Perc.online.purchases", "Download", "GreenAreas_perc")
+
+var_groups = list(
+  territory = area_vars,
+  clinical = c("D_aggregate", "IllnessDuration", "CGI", "psychiatric", "CivilDisability"),
+  substances = c("AlcoholCurrent", "AlcoholAbuseCurrent", "Cannabis", "Substances"),
+  socio_demo = c("Sex", "Age", "Education", "Profession", "MaritalStatus", "Children", "Siblings"))
+
+setdiff(names(Dataset.forest)[-1], unlist(var_groups))
+
+Dataset.model %>%
+  count(Municipality, sort = TRUE) %>%
+  mutate(perc = round(100 * n / sum(n), 1))
+
+Dataset.model %>%
+  group_by(Municipality) %>%
+  summarise(across(all_of(area_vars), n_distinct)) %>%
+  summarise(across(all_of(area_vars), max))
+
+area_lookup = Dataset.model %>%
+  dplyr::select(Municipality, all_of(area_vars)) %>%
+  distinct() %>%
+  mutate(Municipality = as.character(Municipality))
+stopifnot(!anyDuplicated(area_lookup$Municipality),
+          !anyDuplicated(area_lookup[area_vars]))
+
+smotenc_municipality = function(df, outcome = "Total_F", k = 5, over_ratio = .8) {
+  df %>%
+    left_join(area_lookup, by = area_vars) %>%
+    mutate(Municipality = factor(Municipality)) %>%
+    dplyr::select(-all_of(area_vars)) %>%
+    smotenc(var = outcome, k = k, over_ratio = over_ratio) %>%
+    mutate(Municipality = as.character(Municipality)) %>%
+    left_join(area_lookup, by = "Municipality") %>%
+    dplyr::select(all_of(names(df)))
+}
+
+smote_caret = list(
+  name = "SMOTE-NC with municipality as nominal variable",
+  func = function(x, y) {
+    df = smotenc_municipality(bind_cols(tibble(Total_F = y), as_tibble(x)))
+    list(x = as.data.frame(dplyr::select(df, -Total_F)), y = df$Total_F)
+  },
+  first = TRUE)
+
+area_lookup %>%
+  dplyr::select(all_of(area_vars)) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  round(2)
+
+icc.model = lme4::lmer(Total ~ 1 + (1 | Municipality), data = Dataset.model %>% filter(!is_test))
+vc = as.data.frame(lme4::VarCorr(icc.model))
+round(vc$vcov[1] / sum(vc$vcov), 3)
+```
+
+## Automatic selection - H2O AutoML
+
+```{r, eval=FALSE}
+h2o_start()
+set.seed(42)
+# same training and testing datasets used for the other models
+total_train = train.forest
+total_test = test.forest
+
+# run for a maximum of 120 seconds
+auto_char <-
+  auto_ml() %>%
+  set_engine("h2o", max_runtime_secs = 120, seed = 42, 
+             save_data = TRUE,
+             nfolds = 5,
+             keep_cross_validation_predictions = TRUE
+             )%>%
+  set_mode("regression") # we consider the Total score as a continuous variable
+
+recipe <- recipe(Total~., 
+              data = total_train) 
+auto_wflow <-
+  workflow() %>%
+  add_model(auto_char) %>%
+  add_recipe(recipe)
+
+
+auto_fit <- fit(auto_wflow, data = total_train)
+
+tab <- rank_results(auto_fit) %>%
+  filter(.metric == "rmse") %>%
+  arrange(rank)
+# returns the leaderboard in a tidy format with rankings within each metric. A low rank means good performance in a metric.
+
+png("rankingTotal.png", width = 800, height = 400)
+grid.table(tab[1:10,])
+dev.off()
+
+png("ranking_plot_total.png", width = 800, height = 400)
+auto_fit %>%
+  extract_fit_parsnip() %>%
+  member_weights() %>%
+  unnest(importance) %>%
+  filter(type == "scaled_importance") %>%
+  ggplot() +
+  geom_boxplot(aes(value, algorithm)) +
+  theme_minimal() +  
+  theme(
+    axis.text.y = element_text(size = 20), 
+    axis.text.x = element_text(size = 15, angle = 90, hjust = 1, vjust = 0.5),
+    axis.title.y = element_text(size = 20),
+    axis.title.x = element_text(size = 20),
+    plot.title = element_text(hjust = 0.5, size = 20)
+  ) +
+  scale_x_sqrt() +
+  labs(y = NULL, x = "scaled importance", title = "Member importance in stacked ensembles")
+dev.off()
+
+# collected metrics
+collect_metrics(auto_fit, summarize = TRUE) # set to FALSE for a complete list
+
+# Performances per ranking, using a specific metric
+rank_results(auto_fit) %>% distinct(.metric)
+
+
+png("autoplot_rank_total.png", width = 700, height = 300)
+autoplot(auto_fit, type = "rank", metric = c("rmse", "mean_residual_deviance", "r2")) +
+  theme(legend.position = "none")
+dev.off()
+
+predict(auto_fit, new_data = total_test) %>%
+  bind_cols(total_test %>% dplyr::select(Total)) %>%
+  metrics(truth = Total, estimate = .pred)
+
+# several different metrics to use for the classification:
+# AUC (area Under Curve) is excellent to check the ability of a model to separate different classes; for unbalanced dataset, it is better to use precision-recall AUC
+# accuracy: the percentage of correct guesses of the model. Simple and direct, for balanced datasets only.
+# logloss (Logarithmic Loss): wrong predictions are penalised depending on the assigned probability of the correct class (higher penalties if the correct class probability is low)
+# Mean Per Class Accuracy separates information per class: helpful to locate "problematic" classes
+
+
+# To select the best model based on a specific metric:
+
+# best_auc <- select_best(auto_fit, metric = "auc")
+# final_wflow <- finalize_workflow(auto_wflow, best_auc)
+# final_fit <- fit(final_wflow, data = full_data)
+```
+
+
+## Total: single tree, manually parameters set
+
+```{r}
+set.seed(42)
+test.fit = rpart(Total ~ .,
+                 data = train.forest,
+                 method = "anova", # for continuous variables
+#                 parms = list(split = "gini"), # not needed for ANOVA
+                 control = rpart.control(xval = 10, minbucket = 3, minsplit = 9, cp = 0,
+                                         maxdepth = 5)) # 10 cross validation; cp = 0 for no pruning; at least 3 observations in every final leaf
+
+print(test.fit) # `*` marks terminal nodes
+printcp(test.fit) # re.error = proportion of errors in each node; xerror and xstd = error and st.dev of cross validation
+test.fit$variable.importance # hierarchy of variables
+
+rpart.plot(test.fit,
+           type = 4)
+
+# rpart.predict(test.fit, nn = TRUE, rules = FALSE) # posterior classification of individuals
+
+cpt = test.fit$cptable
+best.row = which.min(cpt[, "xerror"])
+cp.1se = cpt[which(cpt[, "xerror"] <= cpt[best.row, "xerror"] + cpt[best.row, "xstd"])[1], "CP"]
+test.prune.002 = rpart::prune(test.fit, cp = cp.1se) # As a rule of thumb, it’s best to prune a decision tree using the cp of smallest tree that is within one standard deviation of the tree with the smallest xerror.
+
+print(test.prune.002)
+test.prune.002$variable.importance
+printcp(test.prune.002)
+
+png("DecisionTreeTotal.png", width=1200, height = 700)
+rpart.plot(test.prune.002,
+           type = 4,
+           cex=1.2,
+           box.palette = "Oranges")
+dev.off()
+
+# rmse
+pred_tree_test = predict(test.prune.002, newdata = test.forest)
+round(sqrt(mean((test.forest$Total - pred_tree_test)^2)),2)
+```
+
+
+### Bagging (single tree)
+
+```{r}
+# bagging
+set.seed(42)
+bag01 = bagging(formula = Total ~ .,
+               data = train.forest,
+               nbagg = 100, 
+               coob = TRUE,
+               control = rpart.control(xval = 10, minbucket = 3, minsplit = 9, cp = 0,
+                                         maxdepth = 5)) # same parameters as previously
+
+bag01 # OOB MSE
+
+control = trainControl(method="cv", number=10) # grid optimum 
+tunegrid = expand.grid(.mtry=c(2:12))
+set.seed(42)
+custom = caret::train(Total~., data=train.forest, method="rf", metric="RMSE", 
+                tuneGrid=tunegrid, ntree = 100, trControl=control)
+custom # mtry = (hyperparameter) how many variables to check at each node?
+
+set.seed(42)
+bag02 = caret::train(form = Total ~ .,
+                     data = train.forest,
+                     method = "treebag",
+                     trControl = trainControl(method = "cv", number = 10),
+                     nbagg = 200,  
+                     control = rpart.control(xval = 10, minbucket = 3, minsplit = 9,
+                                             cp = 0,
+                                             maxdepth = 5))
+bag02
+
+pred_bag_test = predict(bag02, newdata = test.forest)
+round(sqrt(mean((test.forest$Total - pred_bag_test)^2)),2)
+```
+
+### Variable importance
+
+```{r}
+png("Total_Bagging.png", width = 700, height = 600)
+print(plot(varImp(bag02), top = 40)) # variables importance
+dev.off()
+
+pdp_plot <- function(pd, var) {
+  pd <- as.data.frame(pd)
+  p <- ggplot(pd, aes(x = .data[[var]], y = yhat))
+  p <- if (is.numeric(pd[[var]])) p + geom_line(linewidth = 1) else p + geom_point(size = 4)
+  p + theme_minimal()
+}
+
+# Partial dependence plots
+png("Total_Bagging_age.png", width = 600, height = 600)
+print(pdp::partial(bag02, pred.var = "Age",
+                  grid.resolution = 40) %>%
+  pdp_plot("Age") + theme(text = element_text(size = 20), axis.text.x = element_text(angle= 0, hjust=1)))
+dev.off()
+
+
+png("Total_Bagging_illness_duration.png", width = 600, height = 600)
+print(pdp::partial(bag02, pred.var = "IllnessDuration",
+                  grid.resolution = 40) %>%
+  pdp_plot("IllnessDuration") + theme(text = element_text(size = 20), axis.text.x = element_text(angle= 0, hjust=1)))
+dev.off()
+
+png("Total_Bagging_income.png", width = 600, height = 600)
+print(pdp::partial(bag02, pred.var = "Income_percapita",
+                  pred.grid = data.frame(Income_percapita = sort(unique(train.forest$Income_percapita)))) %>%
+  pdp_plot("Income_percapita") + theme(text = element_text(size = 20), axis.text.x = element_text(angle= 0, hjust=1)))
+dev.off()
+
+png("Total_Bagging_green_areas.png", width = 600, height = 600)
+print(pdp::partial(bag02, pred.var = "GreenAreas_perc",
+                  pred.grid = data.frame(GreenAreas_perc = sort(unique(train.forest$GreenAreas_perc)))) %>%
+  pdp_plot("GreenAreas_perc") + theme(text = element_text(size = 20), axis.text.x = element_text(angle= 0, hjust=1)))
+dev.off()
+```
+
+## Bagging with randomForest (mtry = all predictors)
+
+```{r}
+# random forest
+set.seed(42)
+bag.complete = randomForest(Total ~ .,
+                          data = train.forest,
+                          mtry = ncol(train.forest)-1, # use all Xs to build the tree (except the response)
+                          importance = TRUE, # rank the importance of the variables
+                          ntree = 1000)
+bag.complete$mse # oob errors
+
+
+png("Total_OOB_Random_Forest.png", width=800, height = 400)
+plot(bag.complete$mse, main = "OOB error", xlab = "n. of trees", type = "l")
+dev.off()
+
+
+which.min(bag.complete$mse) #find number of trees that produce lowest OOB MSE
+sqrt(bag.complete$mse[which.min(bag.complete$mse)])  #find OOB RMSE of best model
+
+yhat.bag = predict(bag.complete, newdata = test.forest)
+sqrt(mean((yhat.bag-test.forest$Total)^2)) # test RMSE
+
+importance(bag.complete)
+
+png("Total_importance_plot_rf.png", width = 800, height = 400)
+varImpPlot(bag.complete, main = "Importance plot") # variable importance plot
+dev.off()
+
+# sample.tree = getTree(bag.complete, 200, labelVar = TRUE) # extract one tree from the forest
+# sample.tree
+# 
+# require(reprtree) # custom library to plot the single tree from the forest
+# 
+# options(repos='http://cran.rstudio.org')
+# have.packages <- installed.packages()
+# cran.packages <- c('devtools','plotrix','randomForest','tree')
+# to.install <- setdiff(cran.packages, have.packages[,1])
+# if(length(to.install)>0) install.packages(to.install)
+# library(devtools)
+# if(!('reprtree' %in% installed.packages())){
+#     install_github('munoztd0/reprtree')
+#  }
+# for(p in c(cran.packages, 'reprtree')) eval(substitute(library(pkg), list(pkg=p)))
+# 
+# reprtree:::plot.getTree(bag.complete, k = 200, depth = 4,
+#                        cex = 1)
+```
+
+### Tuning
+
+```{r}
+# tuning
+set.seed(42)
+model_tuned = tuneRF(x=train.forest[,-1], # define predictor variables
+                     y=train.forest$Total, # define response variable
+                     ntreeTry=200, # number of trees to build
+                     mtryStart=4, # starting number of predictor variables to consider at each split
+                     stepFactor=1.5, # factor to increase by until the out-of-bag estimated error stops improving by a certain amount
+                     improve=0.01, # amount that the out-of-bag error needs to improve by to keep increasing the step factor
+                     trace=FALSE,
+                     plot=TRUE,
+                     doBest = TRUE # gives directly the best model
+               )
+
+model_tuned
+```
+
+### Diagnostics and variable importance
+
+```{r}
+plot(model_tuned)
+importance(model_tuned)
+
+png("Total_importance_plot_rf_tuned.png", width = 900, height = 500)
+varImpPlot(model_tuned, main = "Importance plot") # variable importance plot
+dev.off()
+
+# Partial dependence plots
+png("Total_partial_dependence_plots1.png", width = 800, height = 500)
+print(pdp::partial(model_tuned, pred.var = "D_aggregate", train = train.forest) %>%
+  pdp_plot("D_aggregate") + theme(
+    axis.text.x = element_text(angle= 45, hjust=1, size=20),
+    axis.text.y = element_text(size = 20), 
+    axis.title.y = element_text(size = 20),
+    axis.title.x = element_text(size = 20)) )
+dev.off()
+
+png("Total_partial_dependence_plots2.png", width = 800, height = 500)
+print(pdp::partial(model_tuned, pred.var = "GreenAreas_perc", train = train.forest,
+                  pred.grid = data.frame(GreenAreas_perc = sort(unique(train.forest$GreenAreas_perc)))) %>%
+  pdp_plot("GreenAreas_perc") + theme(
+    axis.text.x = element_text(angle= 0, hjust=1, size=20),
+    axis.text.y = element_text(size = 20), 
+    axis.title.y = element_text(size = 20),
+    axis.title.x = element_text(size = 20))  )
+dev.off()
+
+png("Total_partial_dependence_plots3.png", width = 800, height = 500)
+print(pdp::partial(model_tuned, pred.var = "Age", train = train.forest,
+                  grid.resolution = 40) %>%
+  pdp_plot("Age") + theme(
+    axis.text.x = element_text(angle= 0, hjust=1, size=20),
+    axis.text.y = element_text(size = 20), 
+    axis.title.y = element_text(size = 20),
+    axis.title.x = element_text(size = 20)) )
+dev.off()
+```
+
+## Random forest (variables random sampling)
+
+```{r}
+# sometimes, some features are super important and will always be used --> trees will end up very similar, and this reduces the advantage of having more trees
+# randomly subset some of the Xs at each split of each tree (one third of the total n. of Xs, the default for regression) --> RANDOM FOREST APPROACH
+set.seed(42)
+rf.complete = randomForest(Total ~ .,
+                          data = train.forest,
+                          mtry = max(floor((ncol(train.forest)-1)/3), 1),
+                          importance = TRUE,
+                          ntree = 1000)
+
+png("Total_OOB_error_rf_mpred.png", width = 800, height = 500)
+plot(rf.complete$mse, main = "OOB error - rf", xlab = "n. of trees", type = "l")
+dev.off()
+
+which.min(rf.complete$mse) #find number of trees that produce lowest OOB MSE
+sqrt(rf.complete$mse[which.min(rf.complete$mse)])  #find OOB RMSE of best model
+```
+
+### Variables importance
+
+```{r}
+varImpPlot(rf.complete, main = "Importance plot - rf") # variable importance plot
+
+yhat.bag.rf = predict(rf.complete, newdata = test.forest)
+sqrt(mean((yhat.bag.rf - test.forest$Total)^2)) # RMSE
+```
+
+### Ablation: random forest without territorial variables
+
+```{r}
+set.seed(42)
+rf.no.area = randomForest(Total ~ .,
+                          data = dplyr::select(train.forest, -all_of(area_vars)),
+                          mtry = max(floor((ncol(train.forest) - 1 - length(area_vars))/3), 1),
+                          ntree = 1000)
+yhat.no.area = predict(rf.no.area, newdata = test.forest)
+
+tibble(model = c("with territorial variables", "without territorial variables"),
+       test_RMSE = c(sqrt(mean((yhat.bag.rf - test.forest$Total)^2)),
+                     sqrt(mean((yhat.no.area - test.forest$Total)^2))))
+
+set.seed(42)
+boot.diff = replicate(2000, {
+  i = sample(nrow(test.forest), replace = TRUE)
+  sqrt(mean((yhat.no.area[i] - test.forest$Total[i])^2)) - sqrt(mean((yhat.bag.rf[i] - test.forest$Total[i])^2))
+})
+quantile(boot.diff, c(.025, .5, .975))
+```
+
+### Prediction (SHAP TEST: on a single individual)
+
+```{r}
+# SHAP test
+
+#  explaining machine learning models with Shapley values. 
+#  widely used approach from cooperative game theory that come with desirable properties.
+explainer = DALEX::explain(model = rf.complete,
+                            data = dplyr::select(train.forest, -Total),
+                           y = train.forest$Total,
+                     label = "Random Forest")
+
+plot(model_performance(explainer = explainer))
+plot(model_diagnostics(explainer = explainer))
+explainer.test = DALEX::explain(model = rf.complete,
+                                data = dplyr::select(test.forest, -Total),
+                                y = test.forest$Total,
+                                label = "Random Forest")
+
+plot(model_parts(explainer = explainer.test,
+            N = NULL)) # feature importance; use all observations
+plot(model_parts(explainer = explainer.test,
+            N = NULL,
+            variable_groups = var_groups))
+
+# SHAP values 
+instance = dplyr::select(test.forest, -Total)[7,]
+shap_perm = predict_parts(explainer, new_observation = instance,
+                          type = "shap", B = 10)
+png("Total_SHAP_7th.png", width=900, height = 600)
+plot(shap_perm)
+dev.off()
+
+test.forest$Total[7]
+round(predict(rf.complete, newdata = test.forest[7,]),1)
+# It includes the Shapley values and box plots summarizing the distributions of the variable-specific contributions for the selected random orderings.
+# each permutation changes the order the variables are used in, and thus their relavite importance. Allows for an overall evaluation of variables importance
+
+```
+
+## Total: grid search
+
+```{r cache = TRUE}
+# 1. type of model definition
+tree_char <- decision_tree(
+  cost_complexity = tune(),  # cp
+  tree_depth = tune(),       # maxdepth
+  min_n = tune()             # minsplit
+  ) %>%
+  set_engine("rpart", model = TRUE) %>% 
+  set_mode("regression")
+
+mlp_param <- extract_parameter_set_dials(tree_char)
+mlp_param
+
+# 2. model formula
+recipe <- recipe(Total~., 
+              data = train.forest)
+
+# 3. tuning options
+ctrl <- control_grid(verbose = FALSE, save_pred = TRUE)
+
+
+# 4. workflow creation
+wf <- workflow() %>%
+  add_model(tree_char) %>%
+  add_recipe(recipe)
+
+# 5. hyperparameters grid to test
+cost_complexity_values <- seq(0.01, 0.10, by = 0.01)
+min_n_values <- seq(2, 7, by = 1)              
+tree_depth_values <- seq(3, 10, by = 1)  
+
+grid <- expand.grid(
+  cost_complexity = cost_complexity_values,
+  min_n = min_n_values,
+  tree_depth = tree_depth_values
+)
+
+# 6. resampling with cross-validation (5-fold)
+set.seed(42)
+folds <- vfold_cv(train.forest, v = 5)
+
+# 7. Grid search
+set.seed(42)
+res <- wf %>%
+  tune_grid(
+    resamples = folds, # resampling with cross validation.
+    grid = grid, # grid to test
+    metrics = metric_set(rmse, mae), # metrics to use for performances evaluation
+    control = ctrl
+  )
+
+# 8. Results
+## 5 best combinations using RMSE
+show_best(res, metric = "rmse")
+
+
+estimates <- collect_metrics(res)
+
+## Predictions
+collect_predictions(res)
+# augment(res) %>% 
+#   ggplot(aes(x=Total, y=.pred, color = Total)) +
+#   geom_point(show.legend = FALSE) +
+#   facet_wrap(~Total)
+
+
+# 9. selection of best combination of hyperparameters 
+best_params <- select_best(res, metric = "rmse")
+best_params
+autoplot(res)
+
+
+# 10. Final workflow using selected hyperparameters
+final_workflow <- wf %>%
+  finalize_workflow(best_params)
+
+# 11. fit the final model on the full training dataset and test it
+
+final_model <- fit(final_workflow, data = train.forest) 
+final_model 
+
+final_plot <- extract_fit_engine(final_model)
+
+png("Total_decision_tree_grid_search.png", width=1200, height = 800)
+rpart.plot(final_plot,
+           type = 4,
+           cex = 1.5,
+           extra = 101,
+           box.palette = "Oranges")
+dev.off()
+
+test_predict <- predict(final_model, new_data = test.forest)
+
+test_metrics <- test.forest %>%
+  bind_cols(test_predict) %>%
+  metrics(truth = Total, estimate = .pred)
+test_metrics
+```
+
+# TOTAL_F SCORE
+
+## Balancing of the training set
+
+```{r}
+Dataset.forest.F = Dataset.model %>% dplyr::select(Total_F, Sex, Age, D_aggregate, IllnessDuration, Education, Profession, MaritalStatus, CivilDisability, Children, Siblings, AlcoholCurrent, AlcoholAbuseCurrent, Cannabis, Substances, CGI, psychiatric, Income_percapita, Density, Services, Employment, Culture, Perc.online.purchases, Download, GreenAreas_perc)
+
+# Train and test dataset
+train.forest.F = Dataset.forest.F[!Dataset.model$is_test, ]
+test.forest.F = Dataset.forest.F[Dataset.model$is_test, ]
+
+# SMOTE-NC generates new lines to balance the category "low" in the training set
+set.seed(42)
+train.forest.F.even = smotenc_municipality(train.forest.F)
+
+table(train.forest.F$Total_F)
+table(train.forest.F.even$Total_F)
+table(test.forest.F$Total_F)
+
+train.forest.F.even2 = train.forest.F.even %>%
+  mutate(Total_F = factor(Total_F, ordered = FALSE)) # Total_F has to be unordered for the model to work
+
+train.forest.F2 = train.forest.F %>%
+  mutate(Total_F = factor(Total_F, ordered = FALSE))
+
+test.forest.F2 = test.forest.F %>%
+  mutate(Total_F = factor(Total_F, ordered = FALSE))
+```
+
+
+## Automatic selection - H2O AutoML
+
+```{r, eval = requireNamespace("h2o", quietly = TRUE)}
+h2o_start()
+set.seed(42)
+
+# run for a maximum of 200 seconds
+auto_char <-
+  auto_ml() %>%
+  set_engine("h2o", max_runtime_secs = 200, seed = 42,
+             max_models = NULL, 
+             save_data = TRUE
+             )%>%
+  set_mode("classification") # categorical variable
+
+recipe <- recipe(Total_F~., 
+              data = train.forest.F.even2) 
+auto_wflow <-
+  workflow() %>%
+  add_model(auto_char) %>%
+  add_recipe(recipe)
+
+
+auto_fit <- fit(auto_wflow, data = train.forest.F.even2)
+
+
+rank_results(auto_fit) %>%
+  filter(.metric == "mean_per_class_error") %>%
+  arrange(rank)
+# returns the leaderboard in a tidy format with rankings within each metric. A low rank means good performance in a metric.
+
+
+auto_fit %>%
+  extract_fit_parsnip() %>%
+  member_weights() %>%
+  unnest(importance) %>%
+  filter(type == "scaled_importance") %>%
+  ggplot() +
+  geom_boxplot(aes(value, algorithm)) +
+  scale_x_sqrt() +
+  labs(y = NULL, x = "scaled importance", title = "Member importance in stacked ensembles")
+
+
+# collected metrics
+collect_metrics(auto_fit, summarize = TRUE)
+
+# Performance plot, with specified metrics
+
+rank_results(auto_fit) %>% distinct(.metric)
+
+autoplot(auto_fit, type = "rank", metric = c("mean_per_class_error", "logloss")) +
+  theme(legend.position = "none")
+
+predict(auto_fit, new_data = test.forest.F2) %>%
+  bind_cols(test.forest.F2 %>% dplyr::select(Total_F)) %>%
+  metrics(truth = Total_F, estimate = .pred_class)
+
+# to select the best model
+# best_auc <- select_best(auto_fit, metric = "auc")
+# final_wflow <- finalize_workflow(auto_wflow, best_auc)
+# final_fit <- fit(final_wflow, data = full_data)
+```
+
+## TotalF: single tree, manually parameters set
+
+```{r}
+# see the corresponding section in TOTAL SCORE for more annotations
+set.seed(42)
+test.fit = rpart(Total_F ~ .,
+                 data = train.forest.F.even,
+                 method = "class", # use "class" to identify Total_F as categorical
+                 parms = list(split = "gini"), 
+                 control = rpart.control(xval = 10, minbucket = 3, minsplit = 9, cp = 0,
+                                         maxdepth = 5))
+
+print(test.fit)
+printcp(test.fit)
+test.fit$variable.importance
+
+rpart.plot(test.fit,
+           type = 4)
+
+# rpart.predict(test.fit, nn = TRUE, rules = FALSE)
+
+cpt = test.fit$cptable
+best.row = which.min(cpt[, "xerror"])
+cp.1se = cpt[which(cpt[, "xerror"] <= cpt[best.row, "xerror"] + cpt[best.row, "xstd"])[1], "CP"]
+test.prune.002 = rpart::prune(test.fit, cp = cp.1se)
+
+print(test.prune.002)
+test.prune.002$variable.importance
+printcp(test.prune.002)
+
+png("Total_F_decision_tree_man.png", width=1200, height = 800)
+rpart.plot(test.prune.002,
+           type = 4,
+           cex = 1.5,
+           extra = 101)
+dev.off()
+
+rpart.plot(test.prune.002,
+           type = 5,
+           cex = 0.5,
+           extra = 4)
+```
+
+### Diagnostics, bagging, and variable importance
+
+```{r}
+# test against other data
+pred = predict(test.prune.002, test.forest.F, type = "class")
+confusionMatrix(data = pred, reference = test.forest.F$Total_F)
+# P-Value [Acc > NIR]: one-sided binomial test of the accuracy against the no-information rate (H0 = accuracy not better than always predicting the largest class); Mcnemar's Test: symmetry of the misclassifications
+
+test.forest.F %>% # same results in two different ways
+  bind_cols(.pred_class = pred) %>%
+  metrics(truth = Total_F, estimate = .pred_class)
+```
+
+```{r}
+# bagging
+
+# as this is a categorical variable, no MSE is calculated
+
+x.train.F = as.data.frame(dplyr::select(train.forest.F, -Total_F))
+
+control = trainControl(method="cv", number=10, sampling = smote_caret) # grid optimum
+tunegrid = expand.grid(.mtry=c(2:12))
+set.seed(42)
+custom = caret::train(x = x.train.F, y = train.forest.F$Total_F,
+                      method="rf", metric="Kappa", 
+                tuneGrid=tunegrid, ntree = 100, trControl=control)
+custom
+
+set.seed(42)
+bag02 = caret::train(x = x.train.F, y = train.forest.F$Total_F,
+                     method = "treebag",
+                     metric = "Kappa",
+                     trControl = trainControl(method = "cv", number = 10, sampling = smote_caret),
+                     nbagg = 200, 
+                     control = rpart.control(xval = 10, minbucket = 3, minsplit = 9,
+                                             cp = 0,
+                                             maxdepth = 5))
+bag02
+
+# test against other data
+pred = predict(bag02, test.forest.F, type = "raw")
+confusionMatrix(data = pred, reference = test.forest.F$Total_F)
+```
+
+
+```{r}
+print(plot(varImp(bag02), top = 40)) # variables importance
+# IllnessDuration, Age, Income_percapita, CGI, psychiatric, Density, 
+
+# Partial dependence plots, stratum-wise
+pdp_by_class <- function(model, var, train_data = train.forest.F) {
+  grid_args <- if (var %in% area_vars) {
+    list(pred.grid = setNames(data.frame(sort(unique(train_data[[var]]))), var))
+  } else {
+    list(grid.resolution = 40)
+  }
+  pdp_all <- map_dfr(c("low", "medium", "high"), function(cl) {
+    do.call(pdp::partial, c(list(model, pred.var = var, prob = TRUE, which.class = cl), grid_args)) %>%
+      as.data.frame() %>%
+      mutate(class = cl)
+  })
+
+  p <- ggplot(pdp_all, aes(x = .data[[var]], y = yhat, color = class)) +
+    geom_point(size = 4)
+  if (is.numeric(pdp_all[[var]])) p <- p + geom_line(linetype = 3, linewidth = 1.5)
+
+  p +
+    labs(x = var, y = "Predicted probability") +
+    theme_minimal() +
+    theme(text = element_text(size = 20), axis.text.x = element_text(angle = 0, hjust = 1), legend.position = "bottom")
+}
+
+for (v in c("IllnessDuration", "Age", "Income_percapita", "CGI", "psychiatric", "Density")) {
+  print(pdp_by_class(bag02, v))
+}
+```
+
+## Bagging with randomForest (mtry = all predictors)
+
+```{r}
+# random forest
+set.seed(42)
+bag.complete = randomForest(Total_F ~ .,
+                          data = train.forest.F.even,
+                          mtry = ncol(train.forest.F.even)-1, # exclude dependant variable
+                          importance = TRUE,
+                          ntree = 1000)
+bag.complete$err.rate # oob errors
+plot(bag.complete$err.rate[,1], main = "OOB error", xlab = "n. of trees", type = "l")
+
+plot(bag.complete$err.rate[,2], main = "Misclassification", xlab = "n. of trees", ylab = "prop. misclassification", type = "l", col = "red", ylim = c(0,.6))
+lines(bag.complete$err.rate[,3], col = "darkgrey", type = "l")
+lines(bag.complete$err.rate[,4], col = "lightgreen", type = "l")
+legend("topright",
+       pch = c(1,1,1),
+       lwd = c(2,2,2),
+       col = c("red","darkgrey","lightgreen"),
+       legend = c("low", "medium", "high"),
+       bty = "n",
+       cex = .8)
+
+which.min(bag.complete$err.rate[,1]) #find number of trees that produces the lowest OOB error
+
+yhat.bag = predict(bag.complete, newdata = test.forest.F)
+mean((as.character(yhat.bag) == as.character(test.forest.F$Total_F))) # accuracy
+
+importance(bag.complete)
+varImpPlot(bag.complete, main = "Importance plot") # variable importance plot
+
+sample.tree = getTree(bag.complete, 200, labelVar = TRUE) # extract one tree from the forest
+sample.tree
+```
+
+### Tuning
+
+```{r}
+set.seed(42)
+
+model_tuned = tuneRF(x=train.forest.F.even[,-1], # define predictor variables
+                     y=train.forest.F.even$Total_F, # define response variable
+                     ntreeTry=500, # number of trees to build
+                     mtryStart=4, # starting number of predictor variables to consider at each split
+                     stepFactor=1.5, # factor to increase by until the out-of-bag estimated error stops improving by a certain amount
+                     improve=0.01, # amount that the out-of-bag error needs to improve by to keep increasing the step factor
+                     trace=FALSE,
+                     plot=TRUE,
+                     doBest = TRUE # gives directly the best model
+               )
+```
+
+### Diagnostics and variable importance
+
+```{r}
+model_tuned
+
+# test against other data
+pred = predict(model_tuned, test.forest.F, type = "class")
+confusionMatrix(data = pred, reference = test.forest.F$Total_F)
+
+test.forest.F %>%
+  bind_cols(.pred_class = pred) %>%
+  metrics(truth = Total_F, estimate = .pred_class)
+
+plot(model_tuned)
+plot(model_tuned$err.rate[,1], main = "OOB error", xlab = "n. of trees", type = "l")
+
+
+plot(model_tuned$err.rate[,2], main = "Misclassification", xlab = "n. of trees", ylab = "prop. misclassification", type = "l", col = "red", ylim = c(0,.6))
+lines(model_tuned$err.rate[,3], col = "darkgrey", type = "l")
+lines(model_tuned$err.rate[,4], col = "lightgreen", type = "l")
+legend("topright",
+       pch = c(1,1,1),
+       lwd = c(2,2,2),
+       col = c("red","darkgrey","lightgreen"),
+       legend = c("low", "medium", "high"),
+       bty = "n",
+       cex = .8)
+
+importance(model_tuned)
+varImpPlot(model_tuned, main = "Importance plot") # variable importance plot
+```
+
+## Random forest (variables random sampling)
+
+```{r}
+set.seed(42)
+rf.complete = randomForest(Total_F ~ .,
+                          data = train.forest.F.even,
+                          mtry = round(sqrt(ncol(train.forest.F.even)-1)),
+                          importance = TRUE,
+                          ntree = 1000)
+plot(rf.complete$err.rate[,1], main = "OOB error - rf", xlab = "n. of trees", type = "l")
+
+plot(rf.complete$err.rate[,2], main = "Misclassification", xlab = "n. of trees", ylab = "prop. misclassification", type = "l", col = "red", ylim = c(0,.6))
+lines(rf.complete$err.rate[,3], col = "darkgrey", type = "l")
+lines(rf.complete$err.rate[,4], col = "lightgreen", type = "l")
+legend("topright",
+       pch = c(1,1,1),
+       lwd = c(2,2,2),
+       col = c("red","darkgrey","lightgreen"),
+       legend = c("low", "medium", "high"),
+       bty = "n",
+       cex = .8)
+
+which.min(rf.complete$err.rate[,1]) #find number of trees that produce lowest OOB error rate
+rf.complete$err.rate[,1][which.min(rf.complete$err.rate[,1])]  #find error rate of best model
+```
+
+### Diagnostics and variable importance
+
+```{r}
+varImpPlot(rf.complete, main = "Importance plot - rf") # variable importance plot
+
+yhat.bag.rf = predict(rf.complete, newdata = test.forest.F)
+mean((as.character(yhat.bag.rf) == as.character(test.forest.F$Total_F))) # accuracy
+
+# test against other data
+confusionMatrix(data = yhat.bag.rf, reference = test.forest.F$Total_F)
+# P-Value [Acc > NIR]: one-sided binomial test of the accuracy against the no-information rate; Mcnemar's Test: symmetry of the misclassifications
+
+test.forest.F %>%
+  bind_cols(.pred_class = yhat.bag.rf) %>%
+  metrics(truth = Total_F, estimate = .pred_class)
+```
+
+### Ablation: random forest without territorial variables
+
+```{r}
+bal_acc = function(truth, pred) mean(sapply(levels(truth), function(l) mean(pred[truth == l] == l)), na.rm = TRUE)
+
+set.seed(42)
+rf.F.no.area = randomForest(Total_F ~ .,
+                            data = dplyr::select(train.forest.F.even, -all_of(area_vars)),
+                            mtry = round(sqrt(ncol(train.forest.F.even) - 1 - length(area_vars))),
+                            ntree = 1000)
+yhat.F.no.area = predict(rf.F.no.area, newdata = test.forest.F)
+
+tibble(model = c("with territorial variables", "without territorial variables"),
+       test_balanced_accuracy = c(bal_acc(test.forest.F$Total_F, yhat.bag.rf),
+                                  bal_acc(test.forest.F$Total_F, yhat.F.no.area)))
+
+set.seed(42)
+boot.diff.F = replicate(2000, {
+  i = sample(nrow(test.forest.F), replace = TRUE)
+  bal_acc(test.forest.F$Total_F[i], yhat.bag.rf[i]) - bal_acc(test.forest.F$Total_F[i], yhat.F.no.area[i])
+})
+quantile(boot.diff.F, c(.025, .5, .975))
+```
+
+### Prediction (SHAP TEST: on a single individual)
+
+```{r}
+# SHAP test
+
+#  explaining machine learning models with Shapley values. 
+#  widely used approach from cooperative game theory that come with desirable properties.
+explainer = DALEX::explain(model = rf.complete,
+                            data = dplyr::select(train.forest.F.even, -Total_F),
+                           y = train.forest.F.even$Total_F,
+                     label = "Random Forest")
+
+plot(model_performance(explainer = explainer))
+plot(model_diagnostics(explainer = explainer))
+explainer.test = DALEX::explain(model = rf.complete,
+                                data = dplyr::select(test.forest.F, -Total_F),
+                                y = test.forest.F$Total_F,
+                                label = "Random Forest")
+
+plot(model_parts(explainer = explainer.test,
+            N = NULL)) # feature importance; use all observations
+plot(model_parts(explainer = explainer.test,
+            N = NULL,
+            variable_groups = var_groups))
+
+# SHAP values 
+seven = dplyr::select(test.forest.F, -Total_F)[7,]
+shap_perm = predict_parts(explainer, new_observation = seven,
+                                        type = "shap", B = 10)
+plot(shap_perm)
+test.forest.F$Total_F[7]
+predict(rf.complete, newdata = test.forest.F[7,])
+# It includes the Shapley values and box plots summarizing the distributions of the variable-specific contributions for the selected random orderings.
+# each permutation changes the order the variables are used in, and thus their relavite importance. Allows for an overall evaluation of variables importance
+
+```
+
+## Total_F: grid search
+
+```{r cache = TRUE}
+
+# for more annotations, see the corresponding chunk in TOTAL SCORE (Total: grid search)
+
+# 1.
+tree_char <- decision_tree(
+  cost_complexity = tune(),  # cp
+  tree_depth = tune(),       # maxdepth
+  min_n = tune()             # minsplit
+) %>%
+  set_engine("rpart", model=TRUE) %>% 
+  set_mode("classification") # qualitative variable
+
+mlp_param <- extract_parameter_set_dials(tree_char)
+mlp_param
+
+# 2.
+recipe <- recipe(Total_F~., 
+              data = train.forest.F2) %>%
+  step_smotenc(Total_F, over_ratio = .8, neighbors = 5)
+
+# 3.
+ctrl<- control_grid(verbose = FALSE, save_pred = TRUE)
+
+# 4.
+wf2 <- workflow() %>%
+  add_model(tree_char) %>%
+  add_recipe(recipe)
+
+# 5.
+cost_complexity_values <- seq(0.01, 0.1, by = 0.01)
+min_n_values <- seq(2, 10, by = 1)                          
+tree_depth_values <- seq(3, 10, by = 1)  
+
+
+grid <- expand.grid(
+  cost_complexity = cost_complexity_values,
+  min_n = min_n_values,
+  tree_depth = tree_depth_values
+)
+
+# 6.
+set.seed(42)
+folds <- vfold_cv(train.forest.F2, v = 5, strata = Total_F)
+
+# 7.
+set.seed(42)
+res <- wf2 %>%
+  tune_grid(
+    resamples = folds,
+    grid = grid,
+    metrics = metric_set(accuracy, roc_auc),
+    control = ctrl
+  )
+
+# 8.
+show_best(res, metric = "roc_auc")
+
+# 9.
+best_params <- select_best(res, metric = "roc_auc")
+best_params
+
+
+# 10.
+final_workflow <- wf2 %>%
+  finalize_workflow(best_params)
+
+
+# 11.
+
+final_model <- fit(final_workflow, data = train.forest.F2)
+final_model
+
+final_plot <- extract_fit_engine(final_model)
+
+png("Total_F_decision_tree_grid_search.png", width=1200, height = 800)
+rpart.plot(final_plot,
+           type = 4,
+           cex = 1.5,
+           extra = 101)
+dev.off()
+```
+
+### Diagnostics and variable importance
+
+```{r}
+test_predictions2 <- predict(final_model, new_data = test.forest.F2)
+
+# test against other data
+confusionMatrix(data = test_predictions2$.pred_class, reference = test.forest.F2$Total_F)
+
+test_metrics2 <- test.forest.F2 %>%
+  bind_cols(test_predictions2) %>%
+  metrics(truth = Total_F, estimate = .pred_class)
+test_metrics2
+
+dotchart(rev(head(extract_fit_engine(final_model)$variable.importance, 40)), xlab = "Importance") # variables importance
+```
